@@ -58,6 +58,9 @@ ansible_playbook_path_fulltechstack = '/opt/acc-core-plugins'
 # Configuration variables for pre-checks
 app_servers_first_url = "{% set server_list = dag_run.conf['mkt'][0]['hosts'].split(',')|sort -%} {{ server_list[0] }},"
 app_servers = "{{ dag_run.conf['mkt'][0]['hosts'] }}" + ","
+mid_servers = "{{ dag_run.conf.get('mid', [{}])[0].get('hosts', '') }}"
+rt_servers = "{{ dag_run.conf.get('rt', [{}])[0].get('hosts', '') }}"
+mid_rt_servers = "{{ [dag_run.conf.get('mid', [{}])[0].get('hosts', ''), dag_run.conf.get('rt', [{}])[0].get('hosts', '')] | select | join(',') + ',' }}"
 region = "{{ dag_run.conf['mkt'][0]['region'] }}"
 build_version = "{{ dag_run.conf['mkt'][0].get('build', dag_run.conf['mkt'][0].get('target_build', dag_run.conf.get('params', {}).get('target_build', 'default'))) }}"
 rds_identifier = "{{ dag_run.conf['mkt'][0]['rdsEndpoint'].split('.')[0].strip() }}"
@@ -241,14 +244,12 @@ def skip_task(do_skip, task_id_no_skip, task_id_skip):
 def gather_and_set_data(instance_id, **kwargs):
     aci_hook = ACIHook(conn_id="cassini_aci", ims_conn_id="cassini_ims")
     tenant_id = aci_hook.get_instance(instance_id).get("tenant_id")
-    exc_tenant_id = aci_hook.get_instance(instance_id).get("exc_tenant_id")
     configs_with_sf_accounts = aci_hook.list_instance_databaseconfigs(
         instance_id,
         filters=["external_accounts.server~.*snowflakecomputing.*"]
     )
     is_snowflake_enabled = len(configs_with_sf_accounts) > 0
     kwargs['ti'].xcom_push(key="tenant_id", value=tenant_id)
-    kwargs["ti"].xcom_push(key="exc_tenant_id", value=exc_tenant_id)
     kwargs['ti'].xcom_push(key="is_snowflake_enabled", value=is_snowflake_enabled)
     return
 
@@ -632,7 +633,7 @@ create_metadata = PythonOperator(
 cluster_adaptation = UCOTriggerDagRunOperator(
     task_id="cluster_adaptation",
     trigger_dag_id="ucoyoda_acc_charms_cluster_adaptations",
-    conf="{{ {'cloudAccountId': dag_run.conf['mkt'][0]['cloudAccountId'] if dag_run.conf['mkt'] else dag_run.conf['cloudAccountId'], 'customerID': dag_run.conf['mkt'][0]['customerID'] if dag_run.conf['mkt'] else dag_run.conf['customerID'], 'mktTenantID': ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id'), 'instanceName': dag_run.conf['mkt'][0]['instanceName'] if dag_run.conf['mkt'] else dag_run.conf['instanceName']} }}",
+    conf="{{ {'cloudAccountId': dag_run.conf['mkt'][0]['cloudAccountId'] if dag_run.conf['mkt'] else dag_run.conf['cloudAccountId'], 'customerID': dag_run.conf['mkt'][0]['customerID'] if dag_run.conf['mkt'] else dag_run.conf['customerID'], 'mktTenantID': ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id')} }}",
     run_num=1,
     parent_execution_date="{{ execution_date }}",
     reset_dag_run=True,
@@ -682,9 +683,9 @@ disable_newrelic_alert_muting = BashOperator(
 
 task_post_service_check = BashOperator(
     task_id="post_service_check",
-    bash_command = "source {provisioning_venv_path}/bin/activate && ansible-playbook -i {app_servers}, {ansible_playbook_path}/post-validation-task.yml".format(
+    bash_command = "source {provisioning_venv_path}/bin/activate && ansible-playbook -i {mid_rt_servers} {ansible_playbook_path}/post-validation-task.yml".format(
                 provisioning_venv_path=provisioning_venv_path,
-                app_servers=app_servers,
+                mid_rt_servers=mid_rt_servers,
                 ansible_playbook_path=ansible_playbook_path,
             ),
     execution_timeout=timedelta(hours=1),
@@ -701,11 +702,7 @@ task_complete_dag = DummyOperator(
 
 monitoring = SlackMonitorOperator(
     task_id="monitoring",
-    channel=(
-        "#raven_uat"
-        if "localhost" in conf.get("webserver", "base_url").lower()
-        else "#charms-rollout-alerts-prod"
-    ),
+    channel="#charms-rollout-alerts-prod",
     conf_key="mkt",
     metadata=[
         "customerName",
@@ -717,14 +714,7 @@ monitoring = SlackMonitorOperator(
     ],
     update_interval=10,
     upload_failure_logs=True,
-    notify_groups=(
-        []
-        if "localhost" in conf.get("webserver", "base_url").lower()
-        else ["@charms-eng"]
-    ),
-    notify_users=(
-        [] if "localhost" in conf.get("webserver", "base_url").lower() else ["@shivams"]
-    ),
+    notify_groups=["@charms-eng"],
     trigger_rule="none_failed_min_one_success",
     dag=dag,
 )
@@ -771,7 +761,7 @@ for env in environments:
             SkippableUCOTriggerDagRunOperator(
                 task_id=env + "-execute-change-on-appserver-" + str(i),
                 trigger_dag_id="ucoyoda_acc_v8ARMCellReadiness",
-                conf="{{ dag_run.conf[params.env][params.int_index] | enrichdagconf(key='mktTenantID', value=ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id')) | enrichdagconf(key='exc_tenant_id', value=ti.xcom_pull(task_ids='gather_and_set_data', key='exc_tenant_id')) if dag_run.conf and params.env in dag_run.conf and params.int_index < (dag_run.conf[params.env]|length) else {} }}",
+                conf="{{ dag_run.conf[params.env][params.int_index] | enrichdagconf(key='mktTenantID', value=ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id')) if dag_run.conf and params.env in dag_run.conf and params.int_index < (dag_run.conf[params.env]|length) else {} }}",
                 run_num=1,
                 params={
                     "env": env,
@@ -797,7 +787,7 @@ for env in environments:
             SkippableUCOTriggerDagRunOperator(
                 task_id=env + "-execute-change-on-all-appserver-" + str(i),
                 trigger_dag_id="ucoyoda_acc_v8ARMCellReadiness",
-                conf="{{ dag_run.conf[params.env][params.int_index] | enrichdagconf(key='mktTenantID', value=ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id')) | enrichdagconf(key='exc_tenant_id', value=ti.xcom_pull(task_ids='gather_and_set_data', key='exc_tenant_id')) if dag_run.conf and params.env in dag_run.conf and params.int_index < (dag_run.conf[params.env]|length) else {} }}",
+                conf="{{ dag_run.conf[params.env][params.int_index] | enrichdagconf(key='mktTenantID', value=ti.xcom_pull(task_ids='gather_and_set_data', key='tenant_id')) if dag_run.conf and params.env in dag_run.conf and params.int_index < (dag_run.conf[params.env]|length) else {} }}",
                 run_num=1,
                 params={
                     "env": env,
